@@ -23,7 +23,8 @@ Thumbs.db
 *.log
 
 # Generated data (can be regenerated with build_data.py)
-data/
+# Uncomment the line below if you don't want to commit the data folder
+# data/
 
 # GTFS source files (too large for git)
 gtfs/
