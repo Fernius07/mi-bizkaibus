@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Buscador Bizkaibus</title>
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: sans-serif;
+        }
+
+        #map {
+            height: 100vh;
+            width: 100%;
+        }
+
+        /* Panel de Control */
+        .info-box {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 1000;
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 0 15px rgba(0, 0, 0, 0.2);
+            width: 220px;
+        }
+
+        /* Input de Búsqueda */
+        #search-input {
+            width: 100%;
+            padding: 8px;
+            margin-top: 10px;
+            margin-bottom: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+
+        .status-dot {
+            height: 10px;
+            width: 10px;
+            background-color: #bbb;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 5px;
+        }
+
+        .status-active {
+            background-color: #009c3c;
+            box-shadow: 0 0 5px #009c3c;
+        }
+
+        /* Icono del Bus (Etiqueta) */
+        .bus-label-icon {
+            background-color: #009c3c;
+            color: white;
+            border: 2px solid white;
+            border-radius: 15px;
+            font-weight: bold;
+            font-size: 11px;
+            text-align: center;
+            padding: 3px 6px;
+            white-space: nowrap;
+            box-shadow: 1px 1px 4px rgba(0, 0, 0, 0.4);
+            width: auto !important;
+            display: inline-block;
+        }
+
+        /* Icono de Parada */
+        .stop-icon {
+            background-color: #ffffff;
+            border: 2px solid #005eb8;
+            /* Bizkaibus Blue */
+            border-radius: 50%;
+            width: 12px !important;
+            height: 12px !important;
+            box-shadow: 0 0 4px rgba(0, 0, 0, 0.4);
+        }
+
+        /* Tabla de llegadas */
+        .arrivals-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+            margin-top: 5px;
+        }
+
+        .arrivals-table th {
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+            padding: 4px;
+            background-color: #f9f9f9;
+        }
+
+        .arrivals-table td {
+            padding: 4px;
+            border-bottom: 1px solid #eee;
+        }
+
+        .arrivals-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .time-cell {
+            font-weight: bold;
+            color: #005eb8;
+            text-align: right;
+        }
+
+        .popup-content {
+            min-width: 250px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="info-box">
+        <div style="display:flex; align-items:center; justify-content:space-between;">
+            <span>Estado:</span>
+            <div>
+                <span id="status-light" class="status-dot"></span>
+                <span id="status-text" style="font-size:12px;">...</span>
+            </div>
+        </div>
+
+        <input type="text" id="search-input" placeholder="Buscar Línea o Bus (Ej: 3247)">
+
+        <div style="font-size:13px; color:#333;">
+            Buses visibles: <b id="bus-count">0</b>
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <script>
+        // --- CONFIGURACIÓN ---
+        const URL_ORIGINAL = "https://ctb-siri.s3.eu-south-2.amazonaws.com/bizkaibus-vehicle-positions.xml";
+        const PROXY_URL = "https://whateverorigin.org/get?url=" + encodeURIComponent(URL_ORIGINAL);
+
+        // Variables Globales
+        var map = L.map('map').setView([43.263, -2.935], 11);
+        var busLayer = L.layerGroup().addTo(map);
+        var stopsLayer = L.layerGroup().addTo(map); // Capa para paradas
+
+        var ultimoXML = null;
+        var filtroActual = "";
+        var servicesData = null; // Para guardar services.json
+        var activeServices = new Set(); // IDs de servicios activos hoy
+
+        // Capa Base
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+            attribution: '© OpenStreetMap'
+        }).addTo(map);
+
+        // --- EVENTO DE BÚSQUEDA ---
+        document.getElementById('search-input').addEventListener('input', function (e) {
+            filtroActual = e.target.value.toLowerCase().trim();
+            if (ultimoXML) {
+                pintarMapa(ultimoXML);
+            }
+        });
+
+        // --- 1. CARGAR DATOS ESTÁTICOS (GTFS) ---
+
+        async function initStaticData() {
+            try {
+                // 1.1 Cargar Servicios (Calendario)
+                const respServices = await fetch('data/services.json');
+                servicesData = await respServices.json();
+                calcularServiciosActivos();
+
+                // 1.2 Cargar Paradas
+                const respStops = await fetch('data/stops.json');
+                const stops = await respStops.json();
+                pintarParadas(stops);
+
+            } catch (e) {
+                console.error("Error cargando datos estáticos:", e);
+            }
+        }
+
+        function calcularServiciosActivos() {
+            const now = new Date();
+            const yyyy = now.getFullYear();
+            const mm = String(now.getMonth() + 1).padStart(2, '0');
+            const dd = String(now.getDate()).padStart(2, '0');
+            const todayStr = `${yyyy}${mm}${dd}`;
+
+            // 0=Domingo, 1=Lunes... en JS. GTFS: 0=Lunes... espera, GTFS calendar es monday, tuesday...
+            // Mapeamos JS day (0-6, Sun-Sat) a índice de array GTFS (0-6, Mon-Sun)
+            // JS: 0(Sun), 1(Mon), 2(Tue)...
+            // GTFS Array en mi JSON: [Mon, Tue, Wed, Thu, Fri, Sat, Sun]
+            const jsDay = now.getDay();
+            const gtfsDayIndex = (jsDay === 0) ? 6 : jsDay - 1;
+
+            activeServices.clear();
+
+            for (const [serviceId, data] of Object.entries(servicesData)) {
+                let isActive = false;
+
+                // Chequear rango fechas
+                if (todayStr >= data.start_date && todayStr <= data.end_date) {
+                    if (data.days[gtfsDayIndex] === 1) {
+                        isActive = true;
+                    }
+                }
+
+                // Chequear excepciones
+                if (data.added.includes(todayStr)) isActive = true;
+                if (data.removed.includes(todayStr)) isActive = false;
+
+                if (isActive) {
+                    activeServices.add(serviceId);
+                }
+            }
+            console.log(`Servicios activos hoy (${todayStr}):`, activeServices.size);
+        }
+
+        function pintarParadas(stops) {
+            stopsLayer.clearLayers();
+
+            const stopIcon = L.divIcon({
+                className: 'stop-icon',
+                iconSize: [12, 12],
+                iconAnchor: [6, 6]
+            });
+
+            stops.forEach(stop => {
+                const marker = L.marker([stop.lat, stop.lon], { icon: stopIcon });
+
+                // FIX: Usar bindPopup + evento popupopen para permitir reabrir
+                marker.bindPopup(`<b>${stop.name}</b><br>Cargando...`);
+
+                marker.on('popupopen', () => {
+                    cargarDatosParada(stop, marker);
+                });
+
+                marker.addTo(stopsLayer);
+            });
+        }
+
+        async function cargarDatosParada(stop, marker) {
+            try {
+                const resp = await fetch(`data/stops/${stop.id}.json`);
+                if (!resp.ok) throw new Error("No hay datos");
+                const arrivals = await resp.json();
+
+                // Filtrar y ordenar
+                const now = new Date();
+                const currentTimeStr = now.toTimeString().split(' ')[0]; // "HH:MM:SS"
+
+                // Filtrar por servicio activo y hora futura
+                const validArrivals = arrivals.filter(a => {
+                    if (!activeServices.has(a.service_id)) return false;
+
+                    // Comparar hora (simple string compare funciona para HH:MM:SS)
+                    return a.time > currentTimeStr;
+                });
+
+                // Coger solo los de la próxima hora (aprox)
+                // O simplemente los siguientes 10
+                const nextArrivals = validArrivals.slice(0, 10);
+
+                // 4. Construir HTML
+                let html = `<div class="popup-content">
+                    <b style="font-size:14px">${stop.name}</b>
+                    <hr style="margin:5px 0; border:0; border-top:1px solid #eee;">
+                    <table class="arrivals-table">
+                        <tr>
+                            <th>Línea</th>
+                            <th>Destino</th>
+                            <th style="text-align:right">Min</th>
+                        </tr>`;
+
+                if (nextArrivals.length === 0) {
+                    html += `<tr><td colspan="3" style="text-align:center; padding:10px;">Sin servicios próximos</td></tr>`;
+                } else {
+                    nextArrivals.forEach(arr => {
+                        const mins = calcularMinutos(currentTimeStr, arr.time);
+                        // Si mins > 60, quizás cortar? El usuario pidió 1h.
+                        if (mins <= 60) {
+                            html += `<tr>
+                                <td><b>${arr.route}</b></td>
+                                <td>${arr.headsign}</td>
+                                <td class="time-cell">${mins}'</td>
+                            </tr>`;
+                        }
+                    });
+                }
+                html += `</table></div>`;
+
+                // Actualizar contenido del popup
+                marker.setPopupContent(html);
+
+            } catch (e) {
+                marker.setPopupContent(`<b>${stop.name}</b><br>Error cargando datos.`);
+            }
+        }
+
+        function calcularMinutos(nowStr, arrStr) {
+            // Convertir HH:MM:SS a minutos desde medianoche
+            function toMins(t) {
+                const [h, m, s] = t.split(':').map(Number);
+                return h * 60 + m;
+            }
+            let nowMins = toMins(nowStr);
+            let arrMins = toMins(arrStr);
+
+            if (arrMins < nowMins) arrMins += 24 * 60; // Caso madrugada prox día (si GTFS usa 00:30 en vez de 24:30)
+
+            return Math.max(0, arrMins - nowMins);
+        }
+
+        // --- 2. DATOS EN TIEMPO REAL (SIRI) ---
+
+        async function actualizarAutobuses() {
+            const statusText = document.getElementById('status-text');
+            const statusLight = document.getElementById('status-light');
+
+            try {
+                const response = await fetch(PROXY_URL + "&_=" + new Date().getTime());
+                if (!response.ok) throw new Error("Error red");
+
+                const data = await response.json();
+                const parser = new DOMParser();
+                ultimoXML = parser.parseFromString(data.contents, "text/xml");
+
+                statusText.innerText = "Online";
+                statusLight.classList.add('status-active');
+
+                pintarMapa(ultimoXML);
+
+            } catch (error) {
+                console.error(error);
+                statusText.innerText = "Reconectando";
+                statusLight.classList.remove('status-active');
+            }
+        }
+
+        function pintarMapa(xmlDoc) {
+            busLayer.clearLayers();
+
+            const vehicles = xmlDoc.getElementsByTagName("VehicleActivity");
+            let contadorVisibles = 0;
+
+            for (let i = 0; i < vehicles.length; i++) {
+                const vehicle = vehicles[i];
+                const journey = vehicle.getElementsByTagName("MonitoredVehicleJourney")[0];
+
+                if (!journey) continue;
+
+                const location = journey.getElementsByTagName("VehicleLocation")[0];
+                const lineRef = journey.getElementsByTagName("VehicleJourneyRef")[0]?.textContent || "";
+                const vehicleRef = journey.getElementsByTagName("VehicleRef")[0]?.textContent || "";
+
+                if (location) {
+                    const lat = location.getElementsByTagName("Latitude")[0]?.textContent;
+                    const lon = location.getElementsByTagName("Longitude")[0]?.textContent;
+
+                    let lineName = "BUS";
+                    if (lineRef) {
+                        const parts = lineRef.split('_');
+                        if (parts.length > 1) lineName = parts[1];
+                    }
+
+                    const cumpleFiltro =
+                        lineName.toLowerCase().includes(filtroActual) ||
+                        vehicleRef.toLowerCase().includes(filtroActual);
+
+                    if (lat && lon && cumpleFiltro) {
+                        contadorVisibles++;
+
+                        const textIcon = L.divIcon({
+                            className: '',
+                            html: `<div class="bus-label-icon">${lineName}</div>`,
+                            iconSize: [50, 22],
+                            iconAnchor: [25, 11]
+                        });
+
+                        const marker = L.marker([lat, lon], { icon: textIcon });
+                        marker.bindPopup(`
+                            <div style="text-align:center">
+                            <b style="font-size:16px">${lineName}</b><br>
+                            <span style="color:#666">Bus Nº: ${vehicleRef}</span>
+                            </div>
+                        `);
+                        marker.addTo(busLayer);
+                    }
+                }
+            }
+            document.getElementById('bus-count').innerText = contadorVisibles;
+        }
+
+        // Arrancar
+        initStaticData(); // Cargar paradas y calendario
+        actualizarAutobuses(); // Cargar buses live
+        setInterval(actualizarAutobuses, 20000);
+
+    </script>
+</body>
+
+</html>
